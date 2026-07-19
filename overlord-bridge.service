@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/ben/Projects/overlord-bridge
-ExecStart=/home/ben/Projects/overlord-bridge/.venv/bin/python /home/ben/Projects/overlord-bridge/bridge.py
+WorkingDirectory=/home/user/Projects/overlord-bridge
+ExecStart=/home/user/Projects/overlord-bridge/.venv/bin/python /home/user/Projects/overlord-bridge/bridge.py
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -15,7 +15,7 @@ Environment=PYTHONUNBUFFERED=1
 # PATH. The brain is chosen via OVERLORD_BRAIN in .env — no unit change needed
 # to switch (just restart the service). codex uses ~/.codex/auth.json, no extra
 # env required here.
-Environment="PATH=/home/ben/Projects/overlord-bridge/.venv/bin:/home/ben/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=/home/user/Projects/overlord-bridge/.venv/bin:/home/user/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
 
 [Install]
 WantedBy=default.target

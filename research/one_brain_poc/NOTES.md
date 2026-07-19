@@ -68,7 +68,7 @@ the socket and pipes terminal I/O both ways. Critically:
 6. Cleaned up: `claude stop 66243b16`, `claude stop 3a85e0ea` (an earlier test
    job from the same run), tmux test sessions killed, scratch dirs removed.
    Ben's real interactive session (pid 27391, `claude --resume
-   6b0ed319-219a-4302-9c26-361d1766c650`, cwd `/home/ben`) was never touched,
+   6b0ed319-219a-4302-9c26-361d1766c650`, cwd `/home/user`) was never touched,
    attached to, or sent any input — confirmed alive and unchanged
    before/after via `ps` and `claude agents --json`.
 

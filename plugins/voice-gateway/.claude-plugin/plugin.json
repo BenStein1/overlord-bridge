@@ -4,8 +4,8 @@
   "version": "1.0.0",
   "mcpServers": {
     "voice-gateway": {
-      "command": "/home/ben/Projects/voice_gateway/.venv/bin/python",
-      "args": ["/home/ben/Projects/voice_gateway/src/voice_gateway/mcp_server.py"]
+      "command": "/home/user/Projects/voice_gateway/.venv/bin/python",
+      "args": ["/home/user/Projects/voice_gateway/src/voice_gateway/mcp_server.py"]
     }
   }
 }

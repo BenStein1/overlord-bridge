@@ -4,8 +4,8 @@
   "version": "1.0.0",
   "mcpServers": {
     "ytmusic-dj": {
-      "command": "/home/ben/Projects/ytmusic-dj/.venv/bin/python",
-      "args": ["/home/ben/Projects/ytmusic-dj/ytmusic_dj/server.py"]
+      "command": "/home/user/Projects/ytmusic-dj/.venv/bin/python",
+      "args": ["/home/user/Projects/ytmusic-dj/ytmusic_dj/server.py"]
     }
   }
 }

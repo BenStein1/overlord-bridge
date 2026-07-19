@@ -1,9 +1,9 @@
 {
     "mcpServers": {
         "overlord": {
-            "command": "/home/ben/Projects/overlord-bridge/.venv/bin/python",
+            "command": "/home/user/Projects/overlord-bridge/.venv/bin/python",
             "args": [
-                "/home/ben/Projects/overlord-bridge/plugins/overlord/scripts/overlord_mcp.py"
+                "/home/user/Projects/overlord-bridge/plugins/overlord/scripts/overlord_mcp.py"
             ]
         }
     }

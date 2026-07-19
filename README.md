@@ -4,7 +4,7 @@ Drive a home-rooted **"Overlord"** from Telegram on your phone. The Overlord's
 **brain is swappable**: Claude (the Claude Agent SDK, the default) or OpenAI
 Codex (the `codex app-server`), selected with one env flag.
 
-The Overlord runs in `/home/ben`, so it can dispatch agents into any
+The Overlord runs in `/home/user`, so it can dispatch agents into any
 `~/Projects/*` or `~/Documents/*` folder. Any action that isn't pre-approved is
 bounced to your phone as an **Allow / Deny** prompt, and an off-limits backstop
 auto-denies obvious secrets — both apply regardless of which brain is active.
@@ -88,8 +88,8 @@ The Overlord is **one conversation**, reachable from your phone *and* your
 terminal — what you do "while mobile" is there when you sit down, and vice versa.
 
 Both sides pin to the active brain's saved id (`.session.claude` or
-`.session.codex`; cwd `/home/ben`, so Claude sessions live in the normal
-`~/.claude/projects/-home-ben/` store):
+`.session.codex`; cwd `/home/user`, so Claude sessions live in the normal
+`~/.claude/projects/-home-user/` store):
 
 - **Terminal:** run `overlord` (symlinked onto your PATH → `overlord-bridge/overlord`).
   It resumes the shared per-brain session so the terminal sees your Telegram
@@ -115,7 +115,7 @@ This works for **both brains** — the terminal `overlord` launcher reads
 
 | Brain | Pinned id file | Terminal resume | Bridge reload watches |
 |-------|----------------|-----------------|------------------------|
-| claude | `.session.claude` | `claude --resume <id>` | `~/.claude/projects/-home-ben/<id>.jsonl` mtime |
+| claude | `.session.claude` | `claude --resume <id>` | `~/.claude/projects/-home-user/<id>.jsonl` mtime |
 | codex  | `.session.codex`  | `codex resume <id>`    | `~/.codex/sessions/**/rollout-*-<id>.jsonl` mtime |
 
 Each brain keeps its **own** pinned thread, so switching brains doesn't mix a
@@ -138,7 +138,7 @@ in `CAPABILITIES.md`. The repo-local marketplace lives at
 Install or refresh the plugin:
 
 ```bash
-codex plugin marketplace add /home/ben/Projects/overlord-bridge
+codex plugin marketplace add /home/user/Projects/overlord-bridge
 codex plugin add overlord@personal
 ```
 
@@ -177,7 +177,7 @@ To run the Overlord on OpenAI Codex instead of Claude:
    # OVERLORD_CODEX_MODEL=          # empty = codex default
    # OVERLORD_CODEX_BIN=codex
    # OVERLORD_CODEX_APP_SERVER_PROXY=false
-   # OVERLORD_CODEX_APP_SERVER_SOCKET=/home/ben/Projects/overlord-bridge/run/codex-app-server.sock
+   # OVERLORD_CODEX_APP_SERVER_SOCKET=/home/user/Projects/overlord-bridge/run/codex-app-server.sock
    # OVERLORD_CODEX_INSTRUCTIONS_FILE=~/Projects/overlord-bridge/AGENTS.md
    ```
 4. **Restart** the service (or the foreground process):
@@ -200,11 +200,11 @@ guardrails come from three places:
   ```
   The bridge also injects it into Codex app-server as `developerInstructions`
   on both `thread/start` and `thread/resume`, because the Overlord cwd is
-  `/home/ben` and Codex would not otherwise discover this repo's `AGENTS.md`.
+  `/home/user` and Codex would not otherwise discover this repo's `AGENTS.md`.
 - **Sandbox + approval policy** — set via `OVERLORD_CODEX_SANDBOX` (default
   `read-only`) and `OVERLORD_CODEX_APPROVAL_POLICY` (default `on-request`),
   passed to `thread/start` / `thread/resume`. The Overlord is rooted at
-  `/home/ben`, so read-only is the conservative default; write actions, such as
+  `/home/user`, so read-only is the conservative default; write actions, such as
   dropping worker dispatch files, become Allow/Deny prompts on your phone.
 - **`PermissionGate`** (shared with the Claude path) auto-denies off-limits
   paths/commands and routes everything else to the phone, timing out into a deny.
@@ -266,7 +266,7 @@ Example local agent dispatch:
 ```json
 {
   "name": "LocalAgent",
-  "folder": "/home/ben/Projects/plexorcist",
+  "folder": "/home/user/Projects/plexorcist",
   "task": "Inspect the project, make the focused fix, validate it, and commit locally.",
   "brain": "local-agent",
   "model": "qwen3-coder-next"
