@@ -1,0 +1,19 @@
+[Unit]
+Description=[Ben] Overlord fetch relay (headless-browser localhost fetch endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ben/Projects/overlord-bridge
+ExecStart=/home/ben/Projects/overlord-bridge/.venv/bin/python /home/ben/Projects/overlord-bridge/modules/fetch_relay.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Playwright's bundled Chromium lives under ~/.cache/ms-playwright; no extra
+# PATH entries are needed beyond the venv itself (no CLI subprocess like
+# `claude`/`codex` is shelled out to here).
+Environment="PATH=/home/ben/Projects/overlord-bridge/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,32 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.session
+.session.*
+.reset-requested.*
+telegram_images/
+dispatch/
+*.bak
+.aider*
+roster.json
+worker_reports/
+run/
+scheduled_resumes/
+
+# Claude Code bg-session worktrees (runtime, not source)
+.claude/worktrees/
+
+# Personal working notes / handoffs — kept on disk, not published
+HANDOFF.md
+OVERLORD_BACKLOG.md
+PROGRESS.md
+TODO.md
+SHARED_BRAIN_TASK.md
+# Runtime logs
+restart-verify.log
+*.log
+
+# Personal live agent instructions (symlinked as ~/.claude/CLAUDE.md) — local only
+AGENTS.md
+COLLABORATION.md

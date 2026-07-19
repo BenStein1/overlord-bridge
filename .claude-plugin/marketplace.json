@@ -1,0 +1,18 @@
+{
+  "name": "nova-local",
+  "owner": {
+    "name": "Ben"
+  },
+  "plugins": [
+    {
+      "name": "ytmusic-dj",
+      "source": "./plugins/ytmusic-dj",
+      "description": "Nova's AI DJ for YouTube Music (MCP tools)"
+    },
+    {
+      "name": "voice-gateway",
+      "source": "./plugins/voice-gateway",
+      "description": "Supervised AI phone calls (Whisper STT, TTS, DTMF) via Ben's Bluetooth phone gateway"
+    }
+  ]
+}

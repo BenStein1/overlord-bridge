@@ -1,0 +1,11 @@
+{
+  "name": "voice-gateway",
+  "description": "Place supervised AI phone calls through Ben's PC-as-Bluetooth-gateway: local Whisper STT, TTS, automatic DTMF via ofono. Tools: hfp_status, lookup_contact, place_call.",
+  "version": "1.0.0",
+  "mcpServers": {
+    "voice-gateway": {
+      "command": "/home/ben/Projects/voice_gateway/.venv/bin/python",
+      "args": ["/home/ben/Projects/voice_gateway/src/voice_gateway/mcp_server.py"]
+    }
+  }
+}

@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Brain-agnostic email sender for the Overlord.
+
+Either brain (Claude or Codex) just shell-invokes this — no SDK, no brain coupling:
+
+    overlord-email --to ben@example.com --subject "Hi" --body "text" [--attach FILE ...]
+
+Creds live in ~/Projects/overlord-bridge/.env (chmod 600, gitignored):
+    GMAIL_USER=you@gmail.com
+    GMAIL_APP_PASSWORD=<16-char Google app password, no spaces>
+
+Install once:  ln -s ~/Projects/overlord-bridge/overlord-email ~/.local/bin/overlord-email
+"""
+from __future__ import annotations
+
+import argparse
+import mimetypes
+import os
+import smtplib
+import sys
+from email.message import EmailMessage
+from pathlib import Path
+
+
+def _load_env(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def main() -> None:
+    base = Path(__file__).resolve().parent
+    _load_env(base / ".env")
+
+    ap = argparse.ArgumentParser(description="Send email as the Overlord (Gmail SMTP).")
+    ap.add_argument("--to", required=True, action="append", help="recipient (repeatable)")
+    ap.add_argument("--subject", required=True)
+    ap.add_argument("--body", default="")
+    ap.add_argument("--attach", action="append", default=[], help="file to attach (repeatable)")
+    ap.add_argument("--from", dest="sender", default=None, help="override From (defaults to GMAIL_USER)")
+    args = ap.parse_args()
+
+    user = os.environ.get("GMAIL_USER")
+    pw = os.environ.get("GMAIL_APP_PASSWORD")
+    if not user or not pw:
+        sys.exit(
+            "Missing GMAIL_USER / GMAIL_APP_PASSWORD in overlord-bridge/.env "
+            "(generate a Google App Password and add both)."
+        )
+
+    msg = EmailMessage()
+    msg["From"] = args.sender or user
+    msg["To"] = ", ".join(args.to)
+    msg["Subject"] = args.subject
+    msg.set_content(args.body or "")
+
+    for f in args.attach:
+        p = Path(f).expanduser()
+        if not p.exists():
+            sys.exit(f"attachment not found: {f}")
+        ctype, _ = mimetypes.guess_type(str(p))
+        maintype, subtype = (ctype or "application/octet-stream").split("/", 1)
+        msg.add_attachment(p.read_bytes(), maintype=maintype, subtype=subtype, filename=p.name)
+
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+        s.starttls()
+        s.login(user, pw)
+        s.send_message(msg)
+
+    extra = f" with {len(args.attach)} attachment(s)" if args.attach else ""
+    print(f"sent to {msg['To']}{extra}")
+
+
+if __name__ == "__main__":
+    main()

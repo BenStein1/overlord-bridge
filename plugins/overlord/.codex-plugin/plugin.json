@@ -1,0 +1,22 @@
+{
+  "name": "overlord",
+  "version": "0.1.0+codex.20260629193110",
+  "description": "Expose Ben's local Overlord capabilities as lazy-loadable MCP tools.",
+  "author": {
+    "name": "Ben local Overlord"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Overlord",
+    "shortDescription": "Email, status, dispatch, and local Overlord capability lookup",
+    "longDescription": "Expose the shared Overlord toolkit as searchable MCP tools so Codex and other MCP-capable agents can discover and use local capabilities instead of relying on prose memory.",
+    "developerName": "Ben local Overlord",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": "Use Overlord tools for local email, bridge status, worker dispatch, and capability lookup."
+  },
+  "mcpServers": "./.mcp.json"
+}

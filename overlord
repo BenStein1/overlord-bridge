@@ -1,0 +1,867 @@
+#!/usr/bin/env bash
+# Launch the terminal Overlord on the SAME session the Telegram bridge uses, so
+# context is shared between phone and terminal — for whichever brain is active.
+#
+# Reads OVERLORD_BRAIN from .env (claude | codex, default claude) and resumes the
+# matching per-brain session id (.session.claude / .session.codex).
+#
+# Install once:  ln -s ~/Projects/overlord-bridge/overlord ~/.local/bin/overlord
+#
+# Usage:
+#   overlord            launch the terminal Overlord on the CURRENT brain
+#   overlord --new      start a FRESH session instead of resuming the pinned one,
+#                       and re-pin to it so Telegram joins the new brain too.
+#                       (Resuming a huge old session only offers "load it all" or
+#                       "burn tokens summarizing it" — sometimes you just want a
+#                       clean slate.)
+#   overlord resume <session-id>
+#                       go back to a specific old session and re-pin to it
+#                       (the counterpart to --new)
+#   overlord status     who am I + bridge health (no brain launched) — run this
+#                       any time a session is unsure it is the Overlord
+#   overlord --codex    switch the bridge to Codex  (edits .env + restarts service)
+#   overlord --claude   switch the bridge to Claude (edits .env + restarts service)
+#   overlord <args...>  any other args pass straight through to claude/codex
+set -euo pipefail
+
+DIR="$HOME/Projects/overlord-bridge"
+ENV_FILE="$DIR/.env"
+SERVICE="overlord-bridge.service"
+
+# Flip OVERLORD_BRAIN in .env to $1, preserving the file's 600 perms and any
+# commented template lines (only the ACTIVE assignment is rewritten).
+set_brain() {
+    local want="$1" tmp
+    tmp="$(mktemp)"
+    grep -vE '^[[:space:]]*OVERLORD_BRAIN[[:space:]]*=' "$ENV_FILE" > "$tmp" 2>/dev/null || true
+    printf 'OVERLORD_BRAIN=%s\n' "$want" >> "$tmp"
+    cat "$tmp" > "$ENV_FILE"   # truncate-in-place keeps inode perms (600)
+    rm -f "$tmp"
+}
+
+restart_service_detached() {
+    if command -v systemd-run >/dev/null 2>&1; then
+        systemd-run --user --quiet --collect --unit="overlord-bridge-restart-$$" \
+            /bin/sh -lc "sleep 2; systemctl --user restart '$SERVICE'" >/dev/null 2>&1 &
+        return 0
+    fi
+    setsid sh -c "sleep 2; systemctl --user restart '$SERVICE'" \
+        >/dev/null 2>&1 < /dev/null &
+}
+
+# Brain-switch flags: flip .env, restart the bridge, report, and exit.
+case "${1:-}" in
+    --codex|--claude)
+        want="${1#--}"
+        set_brain "$want"
+        echo "Overlord brain → ${want}. Restart queued for ${SERVICE}…"
+        restart_service_detached
+        sleep 0.2
+        if systemctl --user is-active "$SERVICE" >/dev/null 2>&1; then
+            echo "✅ bridge now running on ${want}. Run 'overlord' to attach the terminal."
+        else
+            echo "ℹ️ bridge restart is running in the background; re-check in a few seconds."
+        fi
+        exit 0
+        ;;
+esac
+
+# --new: don't resume the pinned session, start a fresh one. Filtered out of the
+# args so it never reaches claude/codex. Everything else passes through untouched.
+# Shared mode is the DEFAULT (Ben: "It should just be able to do this as part of
+# normal function. I shouldnt have to specify"). `overlord` puts his terminal in a
+# background job he attaches to, so Telegram and the CLI are one live conversation.
+# It is the native `claude attach` client, so the real TUI is unchanged. Any
+# unexpected condition falls back to the plain `claude --resume` path, so the
+# worst case is exactly the old behavior. `--no-shared` forces that old path.
+FORCE_NEW=0
+SHARED=1
+_args=()
+for _a in "$@"; do
+    case "$_a" in
+        --new) FORCE_NEW=1 ;;
+        --shared) SHARED=1 ;;
+        --no-shared) SHARED=0 ;;
+        *) _args+=("$_a") ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+# `overlord resume <session-id>`: deliberately go back to a specific old session
+# and re-pin to it, so Telegram follows. The counterpart to --new.
+RESUME_SID=""
+if [[ "${1:-}" == "resume" && -n "${2:-}" ]]; then
+    RESUME_SID="$2"
+    shift 2
+fi
+
+cd "$HOME"   # the Overlord is home-rooted
+
+# Which brain is the bridge configured for?
+BRAIN="$(grep -E '^[[:space:]]*OVERLORD_BRAIN[[:space:]]*=' "$ENV_FILE" 2>/dev/null \
+         | tail -1 | cut -d= -f2 | tr -d "[:space:]\"'" | tr 'A-Z' 'a-z' || true)"
+[[ "$BRAIN" == "codex" ]] || BRAIN="claude"
+
+SESSION_FILE="$DIR/.session.$BRAIN"
+# Fall back to the pre-split file for claude (bridge migrates it on next start).
+if [[ "$BRAIN" == "claude" && ! -s "$SESSION_FILE" && -s "$DIR/.session" ]]; then
+    SESSION_FILE="$DIR/.session"
+fi
+
+read_sid() { tr -d '[:space:]' < "$SESSION_FILE"; }
+read_env() {
+    local key="$1"
+    grep -E "^[[:space:]]*${key}[[:space:]]*=" "$ENV_FILE" 2>/dev/null \
+        | tail -1 | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
+}
+is_truthy() {
+    case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# npm auto-updates Claude Code by staging the new version in a temp dir and
+# renaming it into place, which DELETES the old staging dir. A `--bg` job
+# started before that swap keeps running the now-unlinked binary image just
+# fine (the kernel keeps a deleted-but-open inode alive) — but any NEW
+# posix_spawn against that recorded path (e.g. the helper `claude attach`
+# spawns to bridge the pty) gets ENOENT, and `claude attach` dies instead of
+# reconnecting (observed 2026-07-13: worker aa5b8d5f, cliVersion 2.1.207,
+# daemon/CLI already 2.1.208). Detect it two ways so either is sufficient:
+# the daemon's own version bookkeeping, and /proc's authoritative view of the
+# loaded executable.
+job_is_stale() {
+    local job_id="$1"
+    local daemon_roster="$HOME/.claude/daemon/roster.json"
+    [[ -s "$daemon_roster" ]] || return 1
+    "$DIR/.venv/bin/python3" - "$daemon_roster" "$job_id" "$(claude --version 2>/dev/null)" <<'PYEOF'
+import json, os, sys
+
+roster_path, job_id, current_version = sys.argv[1], sys.argv[2], sys.argv[3]
+current_version = current_version.split()[0] if current_version else ""
+
+try:
+    workers = json.load(open(roster_path)).get("workers", {})
+except Exception:
+    sys.exit(1)
+
+worker = workers.get(job_id)
+if not worker:
+    sys.exit(1)
+
+if current_version and worker.get("cliVersion") and worker["cliVersion"] != current_version:
+    sys.exit(0)
+
+pid = worker.get("pid")
+if pid:
+    try:
+        target = os.readlink(f"/proc/{pid}/exe")
+        if target.endswith(" (deleted)"):
+            sys.exit(0)
+    except OSError:
+        sys.exit(0)  # process gone entirely -- also stale/dead
+
+sys.exit(1)
+PYEOF
+}
+
+# Human-readable version of job_is_stale's finding, for both the crash-avoidance
+# path and `overlord status`.
+stale_worker_reason() {
+    local job_id="$1" daemon_roster="$HOME/.claude/daemon/roster.json"
+    "$DIR/.venv/bin/python3" -c '
+import json, os, sys
+roster_path, job_id, current_version = sys.argv[1], sys.argv[2], sys.argv[3]
+current_version = current_version.split()[0] if current_version else "?"
+try:
+    worker = json.load(open(roster_path)).get("workers", {}).get(job_id, {})
+except Exception:
+    worker = {}
+worker_ver = worker.get("cliVersion") or "?"
+pid = worker.get("pid")
+deleted = False
+if pid:
+    try:
+        deleted = os.readlink(f"/proc/{pid}/exe").endswith(" (deleted)")
+    except OSError:
+        deleted = True
+bits = []
+if worker_ver != current_version:
+    bits.append(f"worker CLI {worker_ver} vs installed {current_version}")
+if deleted:
+    bits.append("binary deleted out from under it (npm auto-update mid-session)")
+print("; ".join(bits) or "stale")
+' "$daemon_roster" "$job_id" "$(claude --version 2>/dev/null)" 2>/dev/null
+}
+
+codex_tui_session_exists() {
+    local sid="$1"
+    [[ -n "$sid" ]] || return 1
+    find "$HOME/.codex/sessions" -type f -name "rollout-*-${sid}.jsonl" -print -quit \
+        | grep -q .
+}
+
+codex_exec() {
+    if [[ -z "${KITTY_WINDOW_ID:-}" ]] \
+        && [[ -z "${WEZTERM_VERSION:-}" ]] \
+        && [[ -z "${WEZTERM_EXECUTABLE:-}" ]] \
+        && command -v kitty >/dev/null 2>&1 \
+        && kitty +kitten icat --detect-support --detection-timeout 1 >/dev/null 2>&1; then
+        KITTY_WINDOW_ID=1 exec codex "$@"
+    fi
+
+    exec codex "$@"
+}
+
+wait_codex_socket() {
+    local socket_path="$1"
+    local i
+    for i in {1..100}; do
+        [[ -S "$socket_path" ]] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
+# `overlord gas`: print the engine gas gauge (claude/nvidia/codex/local-agent:
+# usable, gas%, state, reason) so Ben can eyeball engine availability from the
+# terminal. Launches no brain — same source the Overlord's recommend_engine /
+# engine_gas_gauge MCP tools use. `--json` for the raw payload.
+case "${1:-}" in
+    gas|--gas)
+        shift
+        exec "$DIR/.venv/bin/python3" "$DIR/plugins/overlord/scripts/engine_gauge.py" "$@"
+        ;;
+esac
+
+# `overlord status` (alias `health`): one-shot identity + bridge health. Launches
+# no brain — it just prints. The first lines re-ground a confused session on WHO
+# it is; the rest is a single health sweep so neither brain has to hand-run five
+# checks. Brain-agnostic: Claude or Codex just shell-invokes `overlord status`.
+case "${1:-}" in
+    status|--status|health|--health)
+        ok()  { printf '  [ok]   %s\n' "$1"; }
+        bad() { printf '  [FAIL] %s\n' "$1"; }
+        inf() { printf '  -      %s\n' "$1"; }
+        echo "You are the OVERLORD — home-rooted orchestrator at $HOME."
+        echo "Role: supervisor of named, persistent, per-project workers. You"
+        echo "coordinate and relay; you do not do wide hands-on work from the home"
+        echo "root yourself. Real work lives under ~/Projects and ~/Documents."
+        echo
+        echo "Active brain: ${BRAIN}"
+        if [[ -s "$SESSION_FILE" ]]; then
+            ok "pinned ${BRAIN} session: $(read_sid)"
+        else
+            bad "no pinned ${BRAIN} session file ($SESSION_FILE)"
+        fi
+        if [[ "$BRAIN" == "claude" && -s "$DIR/.session.claude.job" ]]; then
+            job_id="$(cut -d: -f1 < "$DIR/.session.claude.job" | tr -d '[:space:]')"
+            if [[ -n "$job_id" ]] && job_is_stale "$job_id"; then
+                bad "shared job ${job_id} is running a stale worker ($(stale_worker_reason "$job_id")) — next 'overlord' launch will stop it and start a fresh shared job automatically"
+            elif [[ -n "$job_id" ]]; then
+                ok "shared job ${job_id} is running the current CLI binary"
+            fi
+        fi
+        if [[ "$BRAIN" == "codex" ]]; then
+            sock="$(read_env OVERLORD_CODEX_APP_SERVER_SOCKET || true)"
+            [[ -n "$sock" ]] || sock="$DIR/run/codex-app-server.sock"
+            if is_truthy "$(read_env OVERLORD_CODEX_APP_SERVER_PROXY || true)"; then
+                inf "app-server proxy: enabled"
+                if [[ -S "$sock" ]]; then
+                    ok "shared app-server socket present: $sock"
+                else
+                    bad "shared app-server socket missing: $sock"
+                fi
+                if systemctl --user is-active overlord-codex-app-server.service >/dev/null 2>&1; then
+                    ok "shared app-server unit overlord-codex-app-server.service is active"
+                elif [[ -S "$sock" ]]; then
+                    inf "shared app-server unit not visible from this shell; using socket as live signal"
+                else
+                    inf "shared app-server unit state unavailable from this shell"
+                fi
+            else
+                inf "app-server proxy: disabled (set OVERLORD_CODEX_APP_SERVER_PROXY=true for live TUI worker reports)"
+            fi
+        fi
+        if systemctl --user is-active "$SERVICE" >/dev/null 2>&1; then
+            ok "bridge service ${SERVICE} is active"
+        elif [[ "$BRAIN" == "codex" ]] && is_truthy "$(read_env OVERLORD_CODEX_APP_SERVER_PROXY || true)" && [[ -S "${sock:-$DIR/run/codex-app-server.sock}" ]]; then
+            inf "bridge service state unavailable from this shell; shared app-server socket is live"
+        else
+            inf "bridge service state unavailable from this shell (systemctl --user could not answer)"
+        fi
+        if [[ -s "$DIR/roster.json" ]]; then
+            inf "roster file: $DIR/roster.json"
+        fi
+        pend="$(find "$DIR/dispatch" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+        [[ "${pend:-0}" != "0" ]] && inf "pending dispatch files: $pend"
+        exit 0
+        ;;
+esac
+
+if [[ "$BRAIN" == "codex" ]]; then
+    CODEX_PROXY="$(read_env OVERLORD_CODEX_APP_SERVER_PROXY || true)"
+    CODEX_SOCKET="$(read_env OVERLORD_CODEX_APP_SERVER_SOCKET || true)"
+    [[ -n "$CODEX_SOCKET" ]] || CODEX_SOCKET="$DIR/run/codex-app-server.sock"
+
+    if is_truthy "$CODEX_PROXY"; then
+        systemctl --user start "$SERVICE" >/dev/null 2>&1 || true
+        if ! wait_codex_socket "$CODEX_SOCKET"; then
+            echo "⚠️ Codex app-server socket did not appear: ${CODEX_SOCKET}" >&2
+            echo "   Check: journalctl --user -u ${SERVICE} -n 40" >&2
+            exit 1
+        fi
+        if [[ -s "$SESSION_FILE" ]]; then
+            sid="$(read_sid)"
+            echo "Resuming shared Codex session ${sid} via app-server socket…"
+            codex_exec --remote "unix://${CODEX_SOCKET}" resume "$sid" "$@"
+        fi
+        echo "No shared Codex thread yet. Starting a socket-backed Codex TUI."
+        codex_exec --remote "unix://${CODEX_SOCKET}" "$@"
+    fi
+
+    if [[ -s "$SESSION_FILE" ]]; then
+        sid="$(read_sid)"
+        if codex_tui_session_exists "$sid"; then
+            echo "Resuming shared Codex session ${sid} (context shared with Telegram)…"
+            codex_exec resume "$sid" "$@"
+        fi
+        echo "Codex bridge thread ${sid} is not a TUI-resumable session."
+        echo "Resuming the latest home-root Codex TUI session instead."
+        codex_exec resume --last "$@"
+    fi
+    echo "No shared Codex thread yet. Starting a fresh one — note Codex can't pin"
+    echo "an id from the terminal, so to link phone+terminal, send the bridge a"
+    echo "message first, then run 'overlord'."
+    codex_exec "$@"
+fi
+
+# claude brain
+#
+# Not `exec` here: the bridge no longer holds a live claude process between
+# Telegram turns (see modules/claude_brain.py), so the pin is normally free
+# and `--resume` lands in place. But Claude Code will still silently FORK
+# onto a new session id if something else (a stray manual `claude --resume`,
+# a Telegram turn mid-flight) holds the pin at this exact moment. Either way,
+# after the interactive session ends we re-pin to whatever is now the newest
+# transcript in this project dir, so the bridge (and the next `overlord`
+# launch) follow Ben into wherever he actually ended up — pin = last active,
+# not a permanent anchor.
+#
+# That exit-time repin is NOT the primary writer, and must not be relied on as
+# one: it never runs if the machine crashes. The pin is kept live *during* the
+# session by ~/.claude/hooks/pin-overlord-session.sh (SessionStart +
+# UserPromptSubmit, home-root only), so /clear, a fork-on-resume, or a compact
+# re-pins immediately instead of at exit. Without it, a crash left the pin on
+# the session Ben had walked away from and `overlord` resumed the wrong topic
+# (2026-07-13). This block stays as the clean-exit backstop.
+project_key() {
+    "$DIR/.venv/bin/python3" -c '
+import sys
+from claude_agent_sdk import project_key_for_directory
+print(project_key_for_directory(sys.argv[1]))
+' "$1"
+}
+CLAUDE_PROJECT_DIR="$HOME/.claude/projects/$(project_key "$HOME")"
+
+repin_to_newest_session() {
+    local newest newest_sid current
+    newest="$(ls -t "$CLAUDE_PROJECT_DIR"/*.jsonl 2>/dev/null | head -1)"
+    [[ -n "$newest" ]] || return 0
+    newest_sid="$(basename "$newest" .jsonl)"
+    current="$(read_sid 2>/dev/null || true)"
+    if [[ "$newest_sid" != "$current" ]]; then
+        printf '%s' "$newest_sid" > "$DIR/.session.claude"
+        echo "(re-pinned shared Overlord session: ${current:-<none>} -> ${newest_sid})"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Binary pinning — keep the shared session's daemon off the churny npm binary.
+#
+# WHY (root cause confirmed 2026-07-15, see ~/.claude/daemon.log): Claude Code's
+# background daemon (the "supervisor" that hosts the --bg shared session) now
+# watches its OWN executable and self-restarts the instant that file's timestamp
+# changes ("binary at ... changed (mtime changed) — self-restarting for
+# upgrade"), and every restart KILLS the shared session ("bg settled <id>
+# (killed)"). npm's auto-updater rewrites the binary constantly — observed 12+
+# times in ~3h on 2026-07-10, mostly timestamp thrash with no real version
+# change — so Ben's CLI kept dropping to a bare shell while he was away. Before
+# this daemon behavior existed, a running --bg session just kept its already-
+# loaded image and shrugged off npm swaps; that's what "it just sat there" was.
+#
+# FIX: give THAT daemon its own private copy of the binary that npm never
+# touches. The daemon watches process.execPath, so a daemon spawned from the
+# pinned copy watches the pinned path — npm rewriting the npm-global copy no
+# longer matches, so it never self-restarts and the CLI just sits there. The npm
+# install keeps auto-updating for every OTHER use of Claude; only this one long-
+# lived daemon runs pinned, refreshing to the current version the next time a
+# fresh shared session is stood up. Updates are NEVER disabled.
+#
+# The daemon is a per-user singleton and spawns its workers with its OWN exe, so
+# pinning must happen at the DAEMON, not the `claude --bg` client (proven: a
+# --bg launched from the pinned exe still joined the running npm daemon and got
+# an npm-exe worker). Only the shared session uses this daemon — dispatched
+# workers run via the Agent SDK — so replacing it at a fresh standup is safe.
+PIN_ROOT="$HOME/.claude/overlord-pinned"
+
+# Build/locate a stable pinned copy of the CURRENT claude-code package under a
+# version-stamped dir (we NEVER rewrite a dir a live daemon may be watching) and
+# echo the pinned claude.exe path. Echoes nothing and returns 1 on ANY problem,
+# so callers transparently fall back to the normal unpinned launch.
+ensure_pinned_claude() {
+    local src_link src_exe src_pkg cur_ver ver_dir pin_pkg pin_exe tmp
+    src_link="$(command -v claude 2>/dev/null)" || return 1
+    [[ -n "$src_link" ]] || return 1
+    src_exe="$(readlink -f "$src_link" 2>/dev/null)" || return 1
+    [[ -f "$src_exe" ]] || return 1
+    # Don't pin a pin (if PATH ever already points into the pin dir).
+    case "$src_exe" in "$PIN_ROOT"/*) printf '%s' "$src_exe"; return 0 ;; esac
+    src_pkg="$(dirname "$(dirname "$src_exe")")"   # .../@anthropic-ai/claude-code
+    [[ -d "$src_pkg" ]] || return 1
+    cur_ver="$(claude --version 2>/dev/null | awk '{print $1}')"
+    [[ -n "$cur_ver" ]] || return 1
+
+    ver_dir="$PIN_ROOT/v$cur_ver"
+    pin_pkg="$ver_dir/claude-code"
+    pin_exe="$pin_pkg/bin/claude.exe"
+
+    # Already built and runnable for this exact version? Reuse as-is — NEVER
+    # rewrite it (a live daemon may be watching this very file, and rewriting it
+    # would trigger the exact self-restart we're preventing).
+    if [[ -x "$pin_exe" ]] \
+        && [[ "$("$pin_exe" --version 2>/dev/null | awk '{print $1}')" == "$cur_ver" ]]; then
+        prune_stale_pins "$ver_dir"
+        printf '%s' "$pin_exe"; return 0
+    fi
+
+    # Build fresh into a temp dir, then atomically swap into place.
+    tmp="$ver_dir.building.$$"
+    rm -rf "$tmp" 2>/dev/null || true
+    mkdir -p "$tmp" || return 1
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "$src_pkg/" "$tmp/claude-code/" >/dev/null 2>&1 \
+            || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
+    else
+        cp -a "$src_pkg" "$tmp/claude-code" >/dev/null 2>&1 \
+            || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
+    fi
+    # Verify the copy actually runs and reports the expected version.
+    if [[ ! -x "$tmp/claude-code/bin/claude.exe" ]] \
+        || [[ "$("$tmp/claude-code/bin/claude.exe" --version 2>/dev/null | awk '{print $1}')" != "$cur_ver" ]]; then
+        rm -rf "$tmp" 2>/dev/null || true; return 1
+    fi
+    rm -rf "$ver_dir" 2>/dev/null || true
+    mv "$tmp" "$ver_dir" 2>/dev/null || { rm -rf "$tmp" 2>/dev/null || true; return 1; }
+    prune_stale_pins "$ver_dir"
+    printf '%s' "$pin_exe"; return 0
+}
+
+# Remove old version-stamped pins to bound disk, but NEVER delete one whose
+# binary a running process is executing (that would yank a live daemon's image).
+# Keeps the current version dir ($1).
+prune_stale_pins() {
+    local keep="$1" d exe e inuse
+    [[ -d "$PIN_ROOT" ]] || return 0
+    shopt -s nullglob
+    for d in "$PIN_ROOT"/v*/; do
+        d="${d%/}"
+        [[ "$d" == "$keep" ]] && continue
+        [[ -d "$d" ]] || continue
+        exe="$d/claude-code/bin/claude.exe"
+        inuse=""
+        for e in /proc/[0-9]*/exe; do
+            case "$(readlink "$e" 2>/dev/null)" in "$exe"*) inuse=1; break ;; esac
+        done
+        [[ -n "$inuse" ]] && continue
+        rm -rf "$d" 2>/dev/null || true
+    done
+    shopt -u nullglob
+    return 0
+}
+
+# Ensure the daemon that is about to host a FRESH shared session runs the pinned
+# binary. Called ONLY on the stand-up-new path, where any session the current
+# daemon hosted is already gone — so stopping it is safe (and only the shared
+# session ever uses this daemon; dispatched workers use the SDK). If no daemon is
+# running, there's nothing to do: the pinned `claude --bg` below spawns a pinned
+# daemon on its own. If the running daemon is ALREADY pinned, we keep it.
+reap_unpinned_daemon() {
+    local pin_exe="$1" dpid dexe t
+    # `|| true`: `claude daemon status` exits 1 when the daemon is DOWN, and under
+    # the script's `set -euo pipefail` a failing command substitution here would
+    # silently kill `overlord` before it can stand up the shared session (the
+    # 2026-07-16 "typing overlord does nothing" bug — the persistent shared session
+    # used to keep the daemon up, so status returned 0 and this never fired). Daemon
+    # down simply means there's nothing to reap.
+    dpid="$(claude daemon status 2>/dev/null | sed -n 's/^pid:[[:space:]]*//p' | head -1 || true)"
+    [[ -n "$dpid" ]] || return 0
+    dexe="$(readlink "/proc/$dpid/exe" 2>/dev/null || true)"; dexe="${dexe% (deleted)}"
+    [[ "$dexe" == "$pin_exe" ]] && return 0      # already pinned — keep it
+    claude daemon stop --any >/dev/null 2>&1 || true
+    t=0
+    while [[ $t -lt 20 ]]; do
+        claude daemon status >/dev/null 2>&1 || return 0
+        sleep 0.25; t=$((t+1))
+    done
+    return 0
+}
+
+# EXPERIMENTAL, opt-in (`overlord --shared`), never the default path.
+#
+# Uses Claude Code's local background-job daemon (`claude daemon`, `claude
+# --bg`, `claude attach <id>`) discovered 2026-07-13 — see
+# research/one_brain_poc/NOTES.md for the evidence this is based on. Unlike a
+# plain `claude --resume`, a `--bg` job can be attached by MORE THAN ONE
+# client at once with no fork, which is the prerequisite for the bridge to
+# eventually inject Telegram turns into the session Ben's terminal is looking
+# at. This function only sets up Ben's half (get the pin running as an
+# attachable job and attach this terminal to it) — the bridge does not
+# inject into it yet (that's still to be built; see PROGRESS.md).
+#
+# IMPORTANT gotcha (see NOTES.md): `claude agents --json`'s "sessionId" field
+# for kind=="background" entries is an internal job handle, NOT the actual
+# resumed conversation's session id — confirmed by testing (a job resuming
+# session X shows a *different*, random-looking "sessionId" in the roster,
+# while the on-disk transcript for X is correctly updated with no fork).
+# That means "does a job already exist for pin X" CANNOT be answered by
+# matching roster sessionId == pin. Tested and confirmed: naively re-running
+# `claude --bg --resume <sid>` when a job already holds that sid does NOT
+# fork the transcript, but it DOES spin up a second, independent job/process
+# pair pointed at the same session file — an unnecessary process at best, a
+# real race at worst. So: track the job id ourselves in a sidecar file next
+# to the session pin, and only ever create a new job when the sidecar's
+# recorded job id is missing or dead (checked by "id" field membership in
+# the roster, which IS reliable).
+#
+# Roster-based "is a live background --bg job already hosting session id $2"
+# lookup, given roster JSON already fetched into $1. Echoes the job id if so.
+# Factored out so try_shared_attach (below) and the cold-resume guard (further
+# down, before the SHARED dispatch) share one definition of "already live"
+# instead of drifting.
+live_shared_job_in_roster() {
+    "$DIR/.venv/bin/python3" -c '
+import json, sys
+roster = json.loads(sys.argv[1])
+dead = ("exited", "stopped", "failed")
+for e in roster:
+    if (e.get("kind") == "background" and e.get("status") not in dead
+            and e.get("sessionId") == sys.argv[2]):
+        print(e.get("id") or "")
+        break
+' "$1" "$2" 2>/dev/null
+}
+
+# Convenience wrapper for callers with no roster already in hand: fetch one,
+# then reuse live_shared_job_in_roster.
+shared_job_id_for_session() {
+    local sid="$1" roster
+    roster="$(claude agents --json 2>/dev/null)" || return 1
+    [[ -n "$roster" ]] || return 1
+    live_shared_job_in_roster "$roster" "$sid"
+}
+
+# Returns 1 (never exec'd) on ANY unexpected condition, so the caller falls
+# through to the exact same `claude --resume` path used when --shared is not
+# passed at all.
+try_shared_attach() {
+    local sid="$1"; shift
+    command -v claude >/dev/null 2>&1 || return 1
+
+    local roster
+    roster="$(claude agents --json 2>/dev/null)" || return 1
+    [[ -n "$roster" ]] || return 1
+
+    # Already held by a live plain `claude --resume` elsewhere (e.g. Ben's own
+    # already-open terminal)? Can't shared-attach to an interactive session
+    # (proven not to work — see NOTES.md); don't start a competing --bg job on
+    # the same id either, that risks the exact fork this task exists to avoid.
+    if "$DIR/.venv/bin/python3" -c '
+import json, sys
+roster = json.loads(sys.argv[1])
+sys.exit(0 if any(e.get("sessionId") == sys.argv[2] and e.get("kind") == "interactive" for e in roster) else 1)
+' "$roster" "$sid" 2>/dev/null; then
+        echo "(--shared: session ${sid} is already a live interactive session, not a shared job — falling back to plain resume)"
+        return 1
+    fi
+
+    # Is a live background job ALREADY hosting this pin? The roster is keyed on
+    # each job's live session id, so this finds it with or without the sidecar —
+    # which matters after a crash, and matters because `claude --resume` REFUSES
+    # to touch a session a job holds ("currently running as a background agent").
+    local job_file="$DIR/.session.$BRAIN.job" existing
+    existing="$(live_shared_job_in_roster "$roster" "$sid")"
+    if [[ -n "$existing" ]]; then
+        # SELF-HEAL: an npm auto-update mid-session can delete the binary image
+        # the job is running (see job_is_stale above). Left alone, `claude
+        # attach` hard-crashes with a raw ENOENT and dead-ends Ben's terminal
+        # ("Couldn't reconnect ... spawn background service: ENOENT"). Catch it
+        # BEFORE attaching, reap the stale job, and fall through to "stand up a
+        # new one" below so a fresh job resumes the same $sid — the transcript
+        # (and therefore conversation context) carries forward into it, but
+        # anything only in the old job's live memory since its last transcript
+        # write is gone, so say so rather than pretending nothing happened.
+        if job_is_stale "$existing"; then
+            # Last-ditch net: with the daemon pinned this should essentially never
+            # fire. Keep it quiet — no bare-terminal apology (Ben's explicit ask).
+            # We refresh onto a fresh pinned job below; the transcript carries the
+            # conversation forward.
+            echo "(refreshing the shared session…)" >&2
+            claude stop "$existing" >/dev/null 2>&1 || true
+        else
+            printf '%s:%s' "$existing" "$sid" > "$job_file"
+            echo "(joining the shared session — Telegram and this terminal are the same conversation)"
+            local attach_rc=0
+            claude attach "$existing" || attach_rc=$?
+            # Runtime safety net: the pre-check said it was fine but attach still
+            # failed (e.g. it went stale in the gap, or an update landed mid-check).
+            # Re-check now; only treat it as the known stale-binary bug (and
+            # recover) if job_is_stale actually confirms it — an unrelated
+            # nonzero exit (Ben Ctrl+C'd, a real error) must not trigger us to
+            # kill a perfectly fine job.
+            if [[ "$attach_rc" -ne 0 ]] && job_is_stale "$existing"; then
+                echo "(refreshing the shared session…)" >&2
+                claude stop "$existing" >/dev/null 2>&1 || true
+            else
+                exit "$attach_rc"
+            fi
+        fi
+    fi
+
+    # Stand up a new one. NOTE `claude --bg --resume <sid>` does NOT resume in
+    # place: it starts a NEW session id carrying the history forward and leaves
+    # the old transcript frozen. So re-pin to the job's LIVE id, or the bridge
+    # would keep talking to a file nothing writes to, and the next launch would
+    # resume the frozen copy and lose everything said from Telegram.
+    # Stand the job up on a PINNED daemon so an npm auto-update can't self-
+    # restart the daemon out from under it and kill the session (see
+    # ensure_pinned_claude). If pinning is unavailable for any reason, `launch`
+    # stays bare `claude` and behavior is exactly as it was before.
+    local bg_out job_id live_sid pin_exe
+    local -a launch=(claude)
+    pin_exe="$(ensure_pinned_claude 2>/dev/null || true)"
+    if [[ -n "$pin_exe" ]]; then
+        reap_unpinned_daemon "$pin_exe" || true
+        launch=(env "CLAUDE_CODE_EXECPATH=$pin_exe" "$pin_exe")
+    fi
+    # Bound the standup: if it stalls (e.g. waiting on a session lease), return 1
+    # so the caller falls back to the plain `claude --resume` path — which is fast
+    # and reliable — instead of `overlord` hanging with no output (2026-07-16).
+    bg_out="$(timeout 25 "${launch[@]}" --bg --resume "$sid" "$@" 2>&1)" || {
+        echo "(shared standup slow/failed — falling back to plain resume)" >&2
+        echo "$bg_out" >&2; return 1;
+    }
+    job_id="$(printf '%s\n' "$bg_out" | sed -n 's/^backgrounded · \([a-f0-9]*\).*/\1/p' | head -1)"
+    [[ -n "$job_id" ]] || { echo "$bg_out" >&2; return 1; }
+
+    local tries=0
+    while [[ $tries -lt 15 ]]; do
+        live_sid="$("$DIR/.venv/bin/python3" -c '
+import json, subprocess, sys
+try:
+    roster = json.loads(subprocess.run(["claude","agents","--json"],
+                        capture_output=True, text=True, timeout=15).stdout or "[]")
+except Exception:
+    roster = []
+for e in roster:
+    if e.get("id") == sys.argv[1]:
+        print(e.get("sessionId") or "")
+        break
+' "$job_id" 2>/dev/null)"
+        [[ -n "$live_sid" ]] && break
+        sleep 1; tries=$((tries+1))
+    done
+    if [[ -z "$live_sid" ]]; then
+        echo "(could not resolve the shared job's live session id — falling back)" >&2
+        claude stop "$job_id" >/dev/null 2>&1
+        return 1
+    fi
+
+    printf '%s' "$live_sid" > "$SESSION_FILE"
+    printf '%s:%s' "$job_id" "$live_sid" > "$job_file"
+    echo "(shared session live — a Telegram message will land right here in this terminal)"
+    exec "${launch[@]}" attach "$job_id"
+}
+
+# ---------------------------------------------------------------------------
+# COLD-RESUME COST GUARD — measured, not theoretical (Ben, 2026-07-16): pinned
+# session 9c5dd9c5 went idle at 22:09 and got resumed at 23:14 — 65 minutes,
+# just past the 1-hour prompt-cache TTL. `claude --resume` on a big session
+# offers only "load it all" or "summarize"; both reprocess the WHOLE transcript,
+# and cold (no cache hit) that costs ~1.25x per token either way. Summarizing
+# those 429,887 cold tokens burned the last 25% of the 5-hour cap. Contrast: an
+# in-session WARM compact of an 835,510-token context (nearly double the size)
+# cost only ~48,372 weighted units, because cache_read prices at 0.1x. Cold is
+# ~11x worse than warm on HALF the context. The fix is to never be asked: when
+# the pinned session is both cold and big, skip the resume prompt entirely and
+# start fresh from the handoff instead (the header's `--new` escape hatch,
+# just automatic).
+#
+# Fails OPEN on any doubt whatsoever — missing/unreadable transcript, an
+# unparseable usage record, no python — resume proceeds exactly as it does
+# today. Never considered for `--new` (already fresh) or `resume <sid>` (Ben
+# asked for that exact session; cost is his call, not ours to override).
+cold_resume_guard_should_fire() {
+    local sid="$1" transcript mtime now age cold_secs big_tokens context
+    transcript="$CLAUDE_PROJECT_DIR/$sid.jsonl"
+    [[ -s "$transcript" ]] || return 1
+
+    cold_secs="${OVERLORD_COLD_RESUME_SECS:-3300}"
+    big_tokens="${OVERLORD_BIG_CONTEXT_TOKENS:-150000}"
+
+    mtime="$(stat -c %Y "$transcript" 2>/dev/null)" || return 1
+    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
+    now="$(date +%s)" || return 1
+    age=$(( now - mtime ))
+    [[ "$age" -gt "$cold_secs" ]] || return 1   # warm — nothing to guard against
+
+    # Tail the last ~256KB rather than parsing the whole file — these transcripts
+    # reach 20MB, and only the LAST usage record (the session's current context
+    # size) matters.
+    context="$("$DIR/.venv/bin/python3" - "$transcript" <<'PYEOF' 2>/dev/null
+import json
+import os
+import sys
+
+path = sys.argv[1]
+CHUNK = 256 * 1024
+try:
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        f.seek(max(0, size - CHUNK))
+        tail = f.read()
+except Exception:
+    sys.exit(1)
+
+best = None
+for line in tail.split(b"\n"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        rec = json.loads(line)
+    except Exception:
+        continue
+    msg = rec.get("message")
+    usage = msg.get("usage") if isinstance(msg, dict) else None
+    if isinstance(usage, dict) and "input_tokens" in usage:
+        best = usage
+
+if best is None:
+    sys.exit(1)
+
+total = (
+    (best.get("input_tokens") or 0)
+    + (best.get("cache_creation_input_tokens") or 0)
+    + (best.get("cache_read_input_tokens") or 0)
+)
+print(total)
+PYEOF
+)" || return 1
+    [[ "$context" =~ ^[0-9]+$ ]] || return 1
+    [[ "$context" -gt "$big_tokens" ]] || return 1   # small — nothing to guard against
+
+    printf '%s %s\n' "$age" "$context"
+}
+
+# Only the plain-resume shape is even eligible: `--new` is already fresh, and
+# `resume <sid>` is Ben deliberately asking for that exact session. Cheap
+# checks (stat + tail a transcript) run first; the extra `claude agents --json`
+# roster call only happens in the rare case those two already say cold+big, so
+# the common warm/small launch never pays for it.
+if [[ "$BRAIN" == "claude" && "$FORCE_NEW" -eq 0 && -z "$RESUME_SID" ]]; then
+    repin_to_newest_session
+    guard_sid="$(read_sid 2>/dev/null || true)"
+    if [[ -n "$guard_sid" ]]; then
+        guard_out="$(cold_resume_guard_should_fire "$guard_sid" || true)"
+        if [[ -n "$guard_out" ]]; then
+            # A live shared --bg job holding this session means there's no resume
+            # PROMPT to guard against — attaching to it doesn't cost anything, and
+            # abandoning it here would just orphan a perfectly good job.
+            live_job="$(shared_job_id_for_session "$guard_sid" || true)"
+            if [[ -z "$live_job" ]]; then
+                read -r guard_age guard_context <<<"$guard_out"
+                guard_units=$(( guard_context * 125 / 100 ))
+                echo "Pinned session ${guard_sid} is $(( guard_context / 1000 ))K tokens and $(( guard_age / 60 )) min cold -- resuming it would cost ~$(( guard_units / 1000 ))K units to reload or summarize. Starting fresh from the handoff instead."
+                FORCE_NEW=1
+                handoff_candidate=""
+                if [[ -s "$CLAUDE_PROJECT_DIR/memory/_session_handoff.md" ]]; then
+                    handoff_candidate="$CLAUDE_PROJECT_DIR/memory/_session_handoff.md"
+                elif [[ -s "$DIR/HANDOFF.md" ]]; then
+                    handoff_candidate="$DIR/HANDOFF.md"
+                fi
+                if [[ -n "$handoff_candidate" ]]; then
+                    mkdir -p "$HOME/.cache/near-limit-handoff"
+                    printf '%s\n' "$handoff_candidate" > "$HOME/.cache/near-limit-handoff/pending-handoff"
+                else
+                    echo "(no handoff file found — going fresh without one)"
+                fi
+            fi
+        fi
+    fi
+fi
+
+if [[ "$SHARED" -eq 1 && "$BRAIN" == "claude" && "$FORCE_NEW" -eq 0 && -z "$RESUME_SID" ]]; then
+    # Resolve the pin to the LAST ACTIVE session at LAUNCH, not just at exit.
+    # Ben, 2026-07-13: "It wanted to resume a 9h 48 min old session by default."
+    # The exit-time repin never runs if a session is killed or the machine crashes,
+    # and the pin hook only tracks sessions that fire hooks — so the pin drifts, and
+    # reading it blindly drops him into a stale conversation. The newest transcript
+    # in the home-root project dir IS "where Ben actually is": pin = last active, not
+    # a permanent anchor. If that session is already a live background job,
+    # try_shared_attach just attaches to it (see the roster lookup below).
+    repin_to_newest_session
+    sid="$(read_sid 2>/dev/null || true)"
+    if [[ -z "$sid" ]]; then
+        echo "No Overlord session yet — starting a fresh one."
+        exec claude "$@"
+    fi
+    try_shared_attach "$sid" "$@"
+    echo "(--shared: falling back to today's plain resume path)"
+    set +e
+    claude --resume "$sid" "$@"
+    claude_exit=$?
+    set -e
+    repin_to_newest_session
+    exit "$claude_exit"
+fi
+
+if [[ -n "$RESUME_SID" ]]; then
+    sid="$RESUME_SID"
+    printf '%s' "$sid" > "$DIR/.session.claude"
+    echo "Resuming Overlord session ${sid} (re-pinned; Telegram will join it)…"
+    set +e
+    claude --resume "$sid" "$@"
+    claude_exit=$?
+    set -e
+    repin_to_newest_session
+    exit "$claude_exit"
+fi
+
+if [[ "$FORCE_NEW" -eq 0 && -s "$SESSION_FILE" ]]; then
+    sid="$(read_sid)"
+    echo "Resuming shared Overlord session ${sid} (context shared with Telegram)…"
+    set +e
+    claude --resume "$sid" "$@"
+    claude_exit=$?
+    set -e
+    repin_to_newest_session
+    exit "$claude_exit"
+fi
+sid="$(cat /proc/sys/kernel/random/uuid)"
+old_sid="$(read_sid 2>/dev/null || true)"
+printf '%s' "$sid" > "$DIR/.session.claude"
+if [[ "$FORCE_NEW" -eq 1 && -n "$old_sid" ]]; then
+    echo "Starting a FRESH Overlord session ${sid} (clean slate — no old context loaded)."
+    echo "Telegram will join this new one; the previous session ${old_sid} is still on disk"
+    echo "and can be resumed with: overlord resume ${old_sid}"
+else
+    echo "Starting new shared Overlord session ${sid} (Telegram will join it)…"
+fi
+set +e
+claude --session-id "$sid" "$@"
+claude_exit=$?
+set -e
+repin_to_newest_session
+exit "$claude_exit"
