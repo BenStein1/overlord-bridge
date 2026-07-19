@@ -153,6 +153,20 @@ The plugin currently exposes:
 Start a new Codex thread after installing or changing the plugin; existing
 threads may not refresh lazy-loaded tool metadata.
 
+### Companion plugins (separate projects)
+
+The Overlord also drives two other plugins that live in their **own separate
+repos**, not this one:
+
+- **`voice-gateway`** — supervised AI phone calls through a PC-as-Bluetooth
+  gateway (local Whisper STT, TTS, automatic DTMF).
+- **`ytmusic-dj`** — an AI DJ for YouTube Music that resolves seed
+  playlists/tracks to real videoIds and builds playlists.
+
+They register with the bridge exactly like `overlord` does, but their source
+isn't included here. **We may fold these projects into the repo (or publish them
+alongside it) in the future.**
+
 ## Codex brain setup
 
 To run the Overlord on OpenAI Codex instead of Claude:
