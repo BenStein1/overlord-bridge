@@ -24,7 +24,7 @@ common interface and a remote permission gate added.
 | `modules/telegram_handler.py` | Threaded Telegram I/O (owner-gated, chunked, Allow/Deny buttons) |
 | `modules/workers.py` | Dispatch-folder worker runner for Claude, Codex, and local-agent workers; Telegram completion push; worker report audit store |
 | `modules/fetch_relay.py` | Localhost-only headless-Chromium fetch endpoint (`GET /fetch?url=`) for sites that domain-block WebFetch or bot-wall curl; standalone process, own service |
-| `AGENTS.md` | Canonical shared Overlord role, worker dispatch rules, and off-limits list for Claude and Codex |
+| `AGENTS.example.md` | Sanitized template of the canonical shared Overlord instruction file (role, dispatch rules, off-limits). Copy to `AGENTS.md`, edit for your machine, then symlink it as `~/.claude/CLAUDE.md` + `~/AGENTS.md` so Claude and Codex share one file. (Your real `AGENTS.md` stays local — it's gitignored.) |
 | `overlord-bridge.service` | `systemd --user` unit |
 | `overlord-fetch-relay.service` | `systemd --user` unit for `modules/fetch_relay.py` |
 | `.env.example` | Config template |
