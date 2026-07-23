@@ -17,6 +17,14 @@ scheduled_resumes/
 # Claude Code bg-session worktrees (runtime, not source)
 .claude/worktrees/
 
+# Local-only plugin wiring for external projects (ytmusic-dj, voice-gateway).
+# The real code lives in ~/Projects/<name>; these stubs + the nova-local
+# marketplace register them with Claude LOCALLY and must NOT go to the public
+# repo (removed in b676fae on purpose). Paths use ${HOME} so they're portable.
+.claude-plugin/
+plugins/ytmusic-dj/
+plugins/voice-gateway/
+
 # Personal working notes / handoffs — kept on disk, not published
 HANDOFF.md
 OVERLORD_BACKLOG.md

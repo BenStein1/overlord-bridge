@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import importlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -31,6 +32,10 @@ DISPATCH_DIR = BRIDGE_ROOT / "dispatch"
 OVERLORD_BIN = BRIDGE_ROOT / "overlord"
 EMAIL_BIN = BRIDGE_ROOT / "overlord-email"
 SERVER_VERSION = "0.1.0"
+
+# --- net_ssh: held-open remote admin sessions (home-root Overlord only) -----
+NET_SSH_LOG = BRIDGE_ROOT / "net_ssh_audit.log"
+NET_SSH_SOCK_DIR = BRIDGE_ROOT / "run" / "ssh"
 
 # --- auto-resume-after-cap plumbing ---------------------------------------
 SCHEDULED_DIR = BRIDGE_ROOT / "scheduled_resumes"
@@ -522,6 +527,207 @@ WantedBy=timers.target
     }
 
 
+def _net_ssh_guard() -> str | None:
+    """net_ssh is the home-root Overlord's tool ONLY.
+
+    A dispatched worker's MCP server runs with its cwd inside the worker's
+    project folder; the Overlord's server runs at the home root. Refusing
+    anywhere but the home root means a worker can never open an SSH session to
+    Ben's machines, no matter what it's told to do.
+    """
+    try:
+        cwd = Path.cwd().resolve()
+    except Exception:  # noqa: BLE001
+        cwd = None
+    if cwd == Path.home().resolve() or os.environ.get("OVERLORD_NET_SSH_ALLOW") == "1":
+        return None
+    return (
+        f"net_ssh is Overlord-only (home root); refused from cwd {cwd}. "
+        "Dispatched workers cannot open SSH sessions to Ben's machines."
+    )
+
+
+def _net_ssh_target(host: str | None, user: str | None) -> str:
+    host = (host or "").strip()
+    user = (user or "").strip()
+    return f"{user}@{host}" if user and host else host
+
+
+def _net_ssh_sock(target: str) -> Path:
+    # '@', '.', '-' survive so a normal user@host round-trips out of the name.
+    safe = re.sub(r"[^A-Za-z0-9_.@-]", "_", target)
+    return NET_SSH_SOCK_DIR / f"cm-{safe}.sock"
+
+
+def _net_ssh_log(entry: dict[str, Any]) -> None:
+    try:
+        NET_SSH_LOG.parent.mkdir(parents=True, exist_ok=True)
+        entry = {"ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), **entry}
+        with NET_SSH_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception:  # noqa: BLE001 - the audit log must never break a call
+        pass
+
+
+def _net_ssh_up(target: str) -> bool:
+    sock = _net_ssh_sock(target)
+    if not sock.exists():
+        return False
+    try:
+        res = subprocess.run(
+            ["ssh", "-S", str(sock), "-O", "check", "--", target],
+            text=True, capture_output=True, timeout=15, check=False,
+        )
+        return res.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _net_ssh_offlimits(target: str) -> str | None:
+    for frag in ("/.ssh", "id_rsa", "id_ed25519"):
+        if frag in target:
+            return frag
+    return None
+
+
+def net_ssh(
+    action: str,
+    host: str | None = None,
+    command: str | None = None,
+    user: str | None = None,
+    timeout: int = 60,
+    connect_timeout: int = 10,
+    idle_timeout: str = "30m",
+) -> dict[str, Any]:
+    """Open, use, and close a held SSH session to a machine on Ben's LAN.
+
+    A session is a persistent authenticated SSH ControlMaster socket: connect
+    ONCE, run as many commands as you like through it with no re-auth ("working
+    in the box"), then close it. Auth rides Ben's ssh-agent — no identity file,
+    no password prompt. Home-root Overlord only; every call is audit-logged.
+
+    action:
+      * ``connect`` — open the session to host (opens nothing if already up).
+      * ``run``     — run ``command`` in the OPEN session (errors if not connected).
+      * ``close``   — shut the session and confirm the door is closed.
+      * ``status``  — list every host currently connected, verified live.
+    """
+    guard = _net_ssh_guard()
+    if guard:
+        return {"ok": False, "error": guard}
+
+    act = (action or "").strip().lower()
+    try:
+        NET_SSH_SOCK_DIR.mkdir(parents=True, exist_ok=True)
+        NET_SSH_SOCK_DIR.chmod(0o700)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if act == "status":
+        live: list[str] = []
+        if NET_SSH_SOCK_DIR.exists():
+            for sock in sorted(NET_SSH_SOCK_DIR.glob("cm-*.sock")):
+                target = sock.name[len("cm-"):-len(".sock")]
+                if _net_ssh_up(target):
+                    live.append(target)
+                else:
+                    try:
+                        sock.unlink()  # reap a stale/dead socket
+                    except Exception:  # noqa: BLE001
+                        pass
+        return {"ok": True, "connected_to": live, "count": len(live),
+                "message": (f"🔗 Connected to: {', '.join(live)}" if live
+                            else "🔌 Not connected to anything.")}
+
+    target = _net_ssh_target(host, user)
+    if not target:
+        return {"ok": False, "error": "host is required for connect/run/close"}
+    frag = _net_ssh_offlimits(target)
+    if frag:
+        return {"ok": False, "error": f"refused: off-limits fragment {frag!r} in target {target!r}"}
+
+    if act == "connect":
+        if _net_ssh_up(target):
+            _net_ssh_log({"action": "connect", "target": target, "result": "already_open"})
+            return {"ok": True, "connected": True, "target": target, "already_open": True,
+                    "message": f"🔗 Already connected to {target}."}
+        sock = _net_ssh_sock(target)
+        argv = [
+            "ssh", "-f", "-N", "-M", "-S", str(sock),
+            "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={int(connect_timeout)}",
+            "-o", f"ControlPersist={idle_timeout}",
+            "--", target,
+        ]
+        try:
+            res = subprocess.run(argv, text=True, capture_output=True,
+                                 timeout=int(connect_timeout) + 15, check=False)
+        except subprocess.TimeoutExpired:
+            _net_ssh_log({"action": "connect", "target": target, "result": "timeout"})
+            return {"ok": False, "connected": False, "target": target,
+                    "message": f"🔌 Could not connect to {target} (timed out)."}
+        up = res.returncode == 0 and _net_ssh_up(target)
+        _net_ssh_log({"action": "connect", "target": target,
+                      "result": "open" if up else "failed", "returncode": res.returncode})
+        if not up:
+            return {"ok": False, "connected": False, "target": target,
+                    "returncode": res.returncode, "stderr": res.stderr.strip(),
+                    "message": f"🔌 Could not connect to {target}. {res.stderr.strip()}"}
+        return {"ok": True, "connected": True, "target": target,
+                "idle_timeout": idle_timeout,
+                "message": f"🔗 Connected to {target}. Session held open (auto-closes after {idle_timeout} idle)."}
+
+    if act == "run":
+        if not command or not command.strip():
+            return {"ok": False, "error": "command is required for action=run"}
+        if not _net_ssh_up(target):
+            return {"ok": False, "connected": False, "target": target,
+                    "message": f"🔌 Not connected to {target}. Open it first (action=connect)."}
+        try:
+            res = subprocess.run(
+                ["ssh", "-S", str(_net_ssh_sock(target)), "-o", "BatchMode=yes",
+                 "--", target, command],
+                text=True, capture_output=True, timeout=int(timeout), check=False,
+            )
+            timed_out = False
+            rc, out, err = res.returncode, res.stdout, res.stderr
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            rc = 124
+            out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            err = (exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")) + \
+                  f"\n[net_ssh] command timed out after {timeout}s"
+        _net_ssh_log({"action": "run", "target": target, "command": command,
+                      "returncode": rc, "timed_out": timed_out})
+        still = _net_ssh_up(target)
+        return {"ok": rc == 0, "connected": still, "target": target, "command": command,
+                "returncode": rc, "stdout": out.strip(), "stderr": err.strip(),
+                "timed_out": timed_out}
+
+    if act == "close":
+        sock = _net_ssh_sock(target)
+        was_open = _net_ssh_up(target)
+        if was_open:
+            try:
+                subprocess.run(["ssh", "-S", str(sock), "-O", "exit", "--", target],
+                               text=True, capture_output=True, timeout=15, check=False)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            sock.unlink()
+        except Exception:  # noqa: BLE001
+            pass
+        still = _net_ssh_up(target)
+        _net_ssh_log({"action": "close", "target": target, "was_open": was_open,
+                      "closed": not still})
+        return {"ok": not still, "connected": still, "target": target, "was_open": was_open,
+                "message": (f"🔌 Closed the session to {target} — door shut behind me."
+                            if not still else
+                            f"⚠ Tried to close {target} but it still reports open.")}
+
+    return {"ok": False, "error": f"unknown action {action!r}; use connect|run|close|status"}
+
+
 ToolFn = Callable[..., Any]
 TOOLS: dict[str, tuple[ToolFn, dict[str, Any]]] = {
     "list_overlord_capabilities": (
@@ -753,6 +959,56 @@ TOOLS: dict[str, tuple[ToolFn, dict[str, Any]]] = {
                             "description": "override: fire exactly this many seconds from now (ignores reset lookup)"},
                 },
                 "required": ["folder", "task"],
+                "additionalProperties": False,
+            },
+        },
+    ),
+    "net_ssh": (
+        net_ssh,
+        {
+            "description": (
+                "Open, work inside, and close a held SSH session to a machine on "
+                "Ben's LAN (updates/diagnostics). It is a PERSISTENT session: "
+                "action='connect' once (one auth via Ben's ssh-agent), then "
+                "action='run' as many commands as needed through that live "
+                "session, then action='close' to shut the door. action='status' "
+                "lists every host currently connected, verified live.\n\n"
+                "HOME-ROOT OVERLORD ONLY — dispatched workers are refused.\n\n"
+                "APPROVAL RULE (behavioral, enforce it): if BEN told you to reach "
+                "a host IN THE CURRENT REQUEST, that IS your approval — just "
+                "connect. If YOU decide mid-task you need a host Ben did NOT send "
+                "you to, STOP and ask him in plain words first ('I want to check "
+                "logs on 192.168.1.10, can I ssh over?') and wait for his "
+                "yes.\n\n"
+                "CLEARANCE IS ONE TIME, NEVER STANDING: approval covers that one "
+                "connection for that one request. It does NOT carry to the next "
+                "turn, a later 'let me just verify', or a reconnect to the same "
+                "box later. A host Ben cleared earlier is NOT cleared now — ask "
+                "again. Never use a past approval as cover for a connection you "
+                "chose to make, including testing or verifying your own work.\n\n"
+                "ALWAYS tell Ben clearly when you've connected and, when you're "
+                "done, that you've closed the session (door shut behind you). "
+                "Sessions auto-close after 30m idle; every call is audit-logged. "
+                "Auth is ssh-agent only (no identity file, no password prompt), "
+                "so a host that isn't keyed for Ben will fail to connect."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["connect", "run", "close", "status"]},
+                    "host": {"type": "string",
+                             "description": "hostname or IP (required for connect/run/close)"},
+                    "command": {"type": "string",
+                                "description": "shell command to run (required for action=run)"},
+                    "user": {"type": "string",
+                             "description": "remote user, e.g. root; omit to use ssh_config/default"},
+                    "timeout": {"type": "integer", "default": 60,
+                                "description": "seconds to allow a single run command"},
+                    "connect_timeout": {"type": "integer", "default": 10},
+                    "idle_timeout": {"type": "string", "default": "30m",
+                                     "description": "auto-close the held session after this much idle"},
+                },
+                "required": ["action"],
                 "additionalProperties": False,
             },
         },

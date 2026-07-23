@@ -316,6 +316,24 @@ workflow lands.
   caps' utilization %% + reset times. Returns the timer unit + a `cancel_cmd`
   (`systemctl --user stop <unit>.timer`). Built 2026-07-09.
 
+- `net_ssh`: Overlord MCP tool (in `plugins/overlord`) that lets the **Overlord
+  only** (never a dispatched worker) reach machines on Ben's LAN over SSH to
+  update open-source software or diagnose them. It is a HELD session, not a
+  per-command reconnect: `action:"connect"` opens a persistent SSH ControlMaster
+  socket (one auth via Ben's ssh-agent — no identity file, no password prompt),
+  `action:"run"` runs commands inside that live session with no re-auth,
+  `action:"close"` tears it down, `action:"status"` lists live connections.
+  Sessions auto-close after 30m idle (`idle_timeout`); the socket lives under the
+  private `run/ssh/`; every call appends to `net_ssh_audit.log`. Worker exclusion
+  is by cwd — the tool runs only from the home root, and a worker's MCP server
+  runs in its project folder. **Gateway rule (behavioral, in AGENTS.md):** if Ben
+  tells you to reach a host that IS the approval; if you decide on your own you
+  need a host he didn't send you to, ask him first and wait for a yes. Always
+  report connect/close state clearly (🔗/🔌) so Ben always knows whether a door
+  is open. Auth is ssh-agent only, so an unkeyed host just fails to connect.
+  Built 2026-07-22. Registered in `~/.claude.json`, so a new tool appears only in
+  a fresh Overlord session.
+
 ## Keep In Sync
 
 - Update this file whenever a new helper or repeatable workflow becomes part of
